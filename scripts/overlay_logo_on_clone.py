@@ -30,6 +30,13 @@ Options:
     --pad N             Inner padding inside the placeholder, px (default 10)
     --quality N         JPEG quality (default 92)
     --debug             Print detected placeholder bbox + logo size
+    --fallback-corner POS
+                        When no dashed placeholder is detected, place the logo
+                        at this corner (top-left/top-right/bottom-left/bottom-
+                        right) instead of failing. Sizing scales to ~12% of the
+                        image width by default. Set to 'none' to fail (default).
+    --fallback-width N  Logo width in fallback mode (default: 12% of image width)
+    --fallback-margin N Margin from edge in fallback mode (default 32)
 
 Output (stdout, last line):
     OK <out_path> placeholder=(x,y,w,h) logo=(w,h)
@@ -93,6 +100,9 @@ def detect_placeholder(img: Image.Image) -> tuple[int, int, int, int] | None:
         # Must be on the left half (placeholder convention)
         if x0 > W * 0.5:
             continue
+        # Must sit in the top header band — reject card borders deeper in the page
+        if y1 > H * 0.15:
+            continue
         # Reject if too wide+thin (likely a card border or header strip)
         aspect = w / max(h, 1)
         if aspect > 4.0 or aspect < 1.0:
@@ -130,7 +140,9 @@ def render_logo(svg_or_png: Path, target_w: int = 1500) -> Image.Image:
 
 
 def overlay(post_dir: Path, src_override: Path | None, logo_path: Path,
-            out_path: Path, pad: int, quality: int, debug: bool) -> int:
+            out_path: Path, pad: int, quality: int, debug: bool,
+            fallback_corner: str, fallback_width: int | None,
+            fallback_margin: int) -> int:
     if src_override is not None:
         src = src_override
     else:
@@ -145,19 +157,44 @@ def overlay(post_dir: Path, src_override: Path | None, logo_path: Path,
     if debug:
         print(f"[debug] src={src} size={img.size}", file=sys.stderr)
 
-    ph = detect_placeholder(img)
-    if ph is None:
-        print("PLACEHOLDER_NOT_FOUND", file=sys.stderr)
-        return 2
-    px, py, pw, ph_h = ph
-    if debug:
-        print(f"[debug] placeholder=(x{px}, y{py}, w{pw}, h{ph_h}) "
-              f"aspect={pw/ph_h:.2f}", file=sys.stderr)
-
     logo = render_logo(logo_path)
     if debug:
         print(f"[debug] logo_tight={logo.size} aspect={logo.width/logo.height:.2f}",
               file=sys.stderr)
+
+    ph = detect_placeholder(img)
+    if ph is None:
+        if fallback_corner == "none":
+            print("PLACEHOLDER_NOT_FOUND", file=sys.stderr)
+            return 2
+        W, H = img.size
+        target_w = fallback_width if fallback_width else int(W * 0.12)
+        scale = target_w / logo.width
+        new_w = max(1, int(logo.width * scale))
+        new_h = max(1, int(logo.height * scale))
+        logo = logo.resize((new_w, new_h), Image.LANCZOS)
+        if fallback_corner == "top-left":
+            lx, ly = fallback_margin, fallback_margin
+        elif fallback_corner == "top-right":
+            lx, ly = W - logo.width - fallback_margin, fallback_margin
+        elif fallback_corner == "bottom-left":
+            lx, ly = fallback_margin, H - logo.height - fallback_margin
+        elif fallback_corner == "bottom-right":
+            lx, ly = W - logo.width - fallback_margin, H - logo.height - fallback_margin
+        else:
+            print(f"unknown corner: {fallback_corner}", file=sys.stderr)
+            return 2
+        base = img.convert("RGBA")
+        base.alpha_composite(logo, (lx, ly))
+        base.convert("RGB").save(out_path, "JPEG", quality=quality)
+        print(f"OK {out_path} placeholder=FALLBACK corner={fallback_corner} "
+              f"logo=({logo.width},{logo.height}) pos=({lx},{ly})")
+        return 0
+
+    px, py, pw, ph_h = ph
+    if debug:
+        print(f"[debug] placeholder=(x{px}, y{py}, w{pw}, h{ph_h}) "
+              f"aspect={pw/ph_h:.2f}", file=sys.stderr)
 
     # Scale logo to fit inside placeholder (with inner padding), preserve aspect
     max_w = max(1, pw - 2 * pad)
@@ -188,6 +225,10 @@ def main() -> int:
     p.add_argument("--pad", type=int, default=10)
     p.add_argument("--quality", type=int, default=92)
     p.add_argument("--debug", action="store_true")
+    p.add_argument("--fallback-corner", default="none",
+                   choices=["none", "top-left", "top-right", "bottom-left", "bottom-right"])
+    p.add_argument("--fallback-width", type=int, default=None)
+    p.add_argument("--fallback-margin", type=int, default=32)
     args = p.parse_args()
 
     post_dir = args.post_dir.resolve()
@@ -204,6 +245,9 @@ def main() -> int:
         pad=args.pad,
         quality=args.quality,
         debug=args.debug,
+        fallback_corner=args.fallback_corner,
+        fallback_width=args.fallback_width,
+        fallback_margin=args.fallback_margin,
     )
 
 
