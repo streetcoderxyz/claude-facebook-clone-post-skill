@@ -260,7 +260,9 @@ For each post `i` (one set of tool calls per post — NO bash loop):
    - Header trên cùng: dải xanh nhạt. Ở GÓC TRÊN BÊN TRÁI vẽ một khung dạng nét đứt (dashed border) màu xanh nhạt, kích thước khoảng 200×100 px, để chừa chỗ dán logo sau bằng chương trình — KHÔNG vẽ logo hay text nào bên trong khung này.
    ```
 
-   The "dashed rectangle in top-left" instruction is what Phase 3.5's overlay step targets. If you change/omit it, `overlay_logo_on_clone.py` will exit `PLACEHOLDER_NOT_FOUND`.
+   The "dashed rectangle in top-left" instruction is what Phase 3.5's overlay step targets. If you change/omit it, the overlay will silently fall back to a corner stamp (`--fallback-corner top-left`). Pass `--fallback-corner none` if you want a hard failure instead.
+
+   ChatGPT ignores this instruction ~30% of the time even when present, so the fallback is a normal outcome — not an error.
 
    Topic extraction: pull the first 1-2 lines or H1-equivalent from `new-caption.txt`.
 
@@ -275,14 +277,19 @@ For each post `i` (one set of tool calls per post — NO bash loop):
 
    If `url` is still the root chat path or `userMsgs === 0` → re-click via JS once more. If still nothing, the composer is in a broken state — re-fill prompt + retry.
 
-5. **Wait for image generation.** The stop button briefly disappears between "thinking" and "rendering" phases, so a bare `until ... done` loop exits prematurely. Require both: stop-button gone AND a `file_`-prefixed image ≥ 1000px present in the page:
+5. **Wait for image generation.** The stop button briefly disappears between "thinking" and "rendering" phases, so a bare `until ... done` loop exits prematurely. Also, after several posts in the same thread the raw `imgs.length` keeps climbing as duplicates accumulate (each generated image renders 3 times in the conversation), so an absolute count is unreliable. The robust signal is the count of **unique `file_` ids** ≥ 1000 px wide:
 
    ```bash
-   sleep 20  # minimum — image gen never finishes faster than this
-   until OPENCLAW_TIMEOUT=120000 openclaw browser evaluate --fn "() => { var s = document.querySelector('button[data-testid=\"stop-button\"]'); var imgs = Array.from(document.querySelectorAll('img[src*=\"file_\"]')).filter(function(i){return i.naturalWidth >= 1000;}); return (!s && imgs.length >= 2) ? 'done' : 'gen'; }" 2>/dev/null | grep -q "done"; do sleep 10; done; echo "IMAGE_DONE"
+   # Before sending, capture baseline unique-fid count for this thread:
+   #   BASELINE_FIDS=$(... | unique file_ids count after the source was attached)
+   # Then wait for one more unique fid to appear AND stop-button gone:
+   TARGET=$((BASELINE_FIDS + 1))
+   until OPENCLAW_TIMEOUT=120000 openclaw browser evaluate --fn "() => { var s = document.querySelector('button[data-testid=\"stop-button\"]'); var imgs = Array.from(document.querySelectorAll('img[src*=\"file_\"]')).filter(function(i){return i.naturalWidth >= 1000;}); var fids = [...new Set(imgs.map(function(i){ var m = i.src.match(/file_[a-f0-9]+/); return m ? m[0] : ''; }).filter(Boolean))]; return (!s && fids.length >= $TARGET) ? 'done' : 'gen'; }" 2>/dev/null | grep -q "done"; do sleep 15; done; echo "IMAGE_DONE"
    ```
 
-   (`imgs.length >= 2` because the attached source image — also `file_`-prefixed at 2048×2048 — counts as one; the generated output is the second.)
+   Practical pattern for an N-post batch: after attaching post i's source, the unique-fid count is `2*(i-1) + 1` (each prior post contributed source + gen, plus this post's source). Wait for `2*i`. So for post 2 wait for 4, post 3 wait for 6, etc.
+
+   **Long-running waits**: the `until` loop in the foreground will hit Bash's run-too-long block. Spawn it with `run_in_background: true` and let the harness notify on completion — do NOT chain `sleep 25 && until ...` to "preheat" the wait.
 
 6. **Refusal check** (same as WP skill):
 
@@ -292,23 +299,33 @@ For each post `i` (one set of tool calls per post — NO bash loop):
 
    On REFUSED: retry with a safer prompt (no real people, no medical procedures). See `wordpress-generate-missing-images` skill's "Safe pivots" list.
 
-7. **Download the generated image.** The attached source image is also `file_`-prefixed and matches the size filter, so it will be the first candidate the script picks. **Always pass `--skip-ids <source_file_id>`** to skip it. Get the source file_id first:
+7. **Download the generated image.** Multiple `file_` images are in the thread now (every prior post's source + generation, plus this post's source). The newest one is what you want. Snapshot all unique file_ids in order, pick the last as the new one, pass the rest to `--skip-ids`:
 
    ```bash
-   SRC_FID=$(OPENCLAW_TIMEOUT=60000 openclaw browser evaluate --fn '() => { var ta = document.querySelector("#prompt-textarea, [contenteditable=true]"); var form = ta && ta.closest("form"); var imgs = form ? Array.from(form.querySelectorAll("img")) : []; var src = imgs.find(function(i){return i.naturalWidth >= 2000;}); return src ? (src.src.match(/file_[a-f0-9]+/)||[""])[0] : ""; }' 2>&1 | tail -1 | tr -d '"')
-   # Plus any previous post's generated file_ids (from this thread):
+   FIDS=$(OPENCLAW_TIMEOUT=60000 openclaw browser evaluate --fn "() => { var imgs = Array.from(document.querySelectorAll('img[src*=\"file_\"]')).filter(function(i){return i.naturalWidth >= 1000;}); var fids = [...new Set(imgs.map(function(i){ var m = i.src.match(/file_[a-f0-9]+/); return m ? m[0] : ''; }).filter(Boolean))]; return fids.join(','); }" 2>&1 | tail -1 | tr -d '"')
+   NEW=$(echo "$FIDS" | tr ',' '\n' | tail -1)
+   SKIP=$(echo "$FIDS" | sed "s/,$NEW\$//")
    uv run ~/.claude/skills/wordpress-generate-missing-images/scripts/fetch_chatgpt_image.py \
-     <OUT_DIR>/post-<i> 1 --skip-ids "$SRC_FID,$PREV_FIDS"
+     <OUT_DIR>/post-<i> 1 --skip-ids "$SKIP"
    mv <OUT_DIR>/post-<i>/image-1.jpg <OUT_DIR>/post-<i>/new-image.jpg
    ```
 
-   Save the generated `file_id` from the script output into `PREV_FIDS` for subsequent posts.
+   The DOM serializes images in conversation order, so the last unique file_id is always the most recent generation. No need to manually track `PREV_FIDS` across iterations — recompute the list from the DOM each time.
 
    Note: the script also writes `image-1-full.png` (the full-res PNG before JPEG re-encode). **Keep this file** — Phase 3.5's logo overlay uses it as the highest-quality canvas.
 
 8. **Verify with Read tool** (visual check before moving on).
 
 Repeat for every post. **No bash for-loops.**
+
+#### Multi-post session bookkeeping
+
+When N posts go through the same ChatGPT thread, the page accumulates `file_` images: every prior post's source + every prior post's generated output. Two consequences:
+
+1. **Wait condition can't use absolute counts** — see Phase 3 step 5. Always recompute the unique-fid count from the DOM, don't hardcode `>= 2`.
+2. **`--skip-ids` grows each post** — never paste a stale skip-list from a previous post. The Phase 3 step 7 snippet recomputes the list from the DOM each iteration, which is the right pattern.
+
+If a single thread accumulates more than ~12-15 posts, ChatGPT performance degrades (slower responses, occasional UI lag). For batches > 12 posts, split across multiple threads by deleting the thread mid-batch (Phase 5 instructions) and starting fresh.
 
 ### Phase 3.5 — Overlay the Omini logo
 
@@ -325,16 +342,24 @@ Output:
 ```
 OK <OUT_DIR>/post-<i>/new-image-logo.jpg placeholder=(x,y,w,h) logo=(w,h) pos=(x,y)
 ```
+…or `placeholder=FALLBACK corner=top-left ...` when the detector couldn't find a dashed placeholder (the script's default is to corner-stamp instead of failing — see `--fallback-corner`).
 
 The script:
 - Uses `image-1-full.png` (1254×1254 ChatGPT original) as canvas when present; falls back to `new-image.jpg`. **Always overlay on the full-res PNG, never on a downscaled JPEG.**
-- Auto-detects the dashed placeholder by color + connected components (no hand-tuned coords).
+- Auto-detects the dashed placeholder by blue-channel dominance + connected components (handles both pale periwinkle and saturated medium-blue dashes ChatGPT alternates between).
 - Renders the logo SVG large, tight-crops to the visible glyph bbox (the SVG has internal transparent padding that would otherwise make the logo look tiny), then scales-to-fit inside the placeholder with `--pad 10`.
+- **Caps the rendered logo at `--max-width-pct` of the image width** (default 0.15 = 15%). If ChatGPT drew an oversized placeholder, the logo won't grow to fill it — it stays a tasteful brand mark, centered inside.
 - **Keeps the dashed border visible** as a frame — it doesn't paint over it. Logo is centered inside.
 
+Useful overrides:
+- `--max-width-pct 0.12` — slightly smaller logo if 15% feels too big for your design.
+- `--fallback-corner top-right|bottom-left|...` — different corner if your prompt reserves a different spot.
+- `--fallback-corner none` — fail instead of falling back. Use only when a missing logo is a hard error (e.g. ad approvals).
+- `--src <path>` — overlay on a specific source file instead of the auto-pick.
+
 Failure modes:
-- Exit 2 `PLACEHOLDER_NOT_FOUND` → the model didn't draw the dashed placeholder. Either re-prompt explicitly mentioning "dashed rectangle top-left for logo, do not draw any logo", or set `LOGO_OVERLAY=false` for this slot and continue without the logo.
-- Exit 2 `SRC_MISSING` → upstream step failed; flag INCOMPLETE.
+- Exit 2 `SRC_MISSING` → no `image-1-full.png` and no `new-image.jpg` in the post dir. Upstream step failed; flag INCOMPLETE.
+- Exit 2 `PLACEHOLDER_NOT_FOUND` → only happens with `--fallback-corner none`. With the default, this becomes a `placeholder=FALLBACK` output instead.
 
 Verify the result with Read tool, then move to the next post.
 
@@ -435,6 +460,9 @@ To upload to your FB group manually:
 14. **Use `attach_image_to_chatgpt.py` for ChatGPT file attachment** — never plain `openclaw browser upload`. ChatGPT's React handler ignores upload-armed file choosers; the helper does the React-aware DataTransfer dance.
 15. **Always send via JS `data-testid="send-button"` click**, not the snapshot ref. The ref click frequently no-ops on the composer because the React onClick isn't bound to the OS click event.
 16. **Overlay the logo on `image-1-full.png`, not on the JPEG.** The PNG is the actual ChatGPT output at native resolution; the JPEG is a downscaled re-encode. Overlaying on the JPEG bakes in compression artifacts under the logo.
+17. **Recompute the unique-file-id list from the DOM every post, never cache it.** When N posts share a ChatGPT thread, the page accumulates source + generated images for each prior post. A stale `PREV_FIDS` cache means `fetch_chatgpt_image.py` picks an old image; absolute count thresholds (`imgs.length >= 2`) silently break after post 1.
+18. **Cap the rendered logo with `--max-width-pct` (default 0.15).** ChatGPT sometimes draws a placeholder taking 30%+ of image width. Filling it with logo produces a billboard. The cap keeps the brand mark proportional even when the placeholder isn't.
+19. **Background-spawn the wait loop, don't preheat with `sleep`.** Bash blocks `sleep N && until ...`. Use `run_in_background: true` and let the harness notify on completion.
 
 ---
 
@@ -452,7 +480,11 @@ To upload to your FB group manually:
 | Clicking the snapshot ref for "Send prompt" doesn't actually send | Common — the ref click bypasses React. Use the JS pattern in Phase 3 step 5 (`document.querySelector('button[data-testid="send-button"]').click()`). Verify by checking that `location.href` transitions to `/c/<uuid>`. |
 | `until ... done` exits immediately when generation hasn't started | The stop-button disappears briefly between phases. Use the stronger wait condition in Phase 3 step 6 (require both `!stop && img[src*="file_"].length >= 2`). |
 | `fetch_chatgpt_image.py` picks the attached SOURCE image instead of the generation | The source is also `file_`-prefixed and ≥ 2048px so it passes the filter. Always pass `--skip-ids <source_file_id>` — see Phase 3 step 8 for how to grab the source's file_id from the composer. |
-| `overlay_logo_on_clone.py` exits with `PLACEHOLDER_NOT_FOUND` | ChatGPT didn't draw the dashed rectangle. Re-prompt: "Vẽ thêm một khung dạng nét đứt ở góc trên bên trái, kích thước khoảng 200×100 px, để dán logo sau." Re-download, re-overlay. |
+| `overlay_logo_on_clone.py` exits with `PLACEHOLDER_NOT_FOUND` | Only happens with `--fallback-corner none`. With the default `top-left` fallback, the script corner-stamps the logo instead — no action needed for most workflows. If you do need a placeholder, re-prompt: "Vẽ thêm một khung dạng nét đứt ở góc trên bên trái, kích thước khoảng 200×100 px, để dán logo sau." |
+| Overlay output shows `placeholder=FALLBACK` instead of measured coords | ChatGPT didn't draw a dashed rectangle this time. The logo was corner-stamped at `--max-width-pct` size. Acceptable in most cases; re-prompt only if you need the placeholder framing. |
+| Logo looks **too big** dominating the design | The ChatGPT-drawn placeholder was oversized. Re-run overlay with `--max-width-pct 0.12` (or lower) to cap the logo regardless of placeholder size. |
+| Logo looks **too small** inside a large empty dashed box | Detection missed the actual placeholder and fell back to corner. Check `--debug` output: if it says `placeholder=FALLBACK` but you can see a placeholder in the image, the dash color is outside the detector's blue-dominance range — file a bug with the image so the color filter can be widened. |
+| Logo landed on top of a section header (e.g. "1. Triệu chứng" pill) | Stale detector — pull the latest skill version. The current detector rejects candidates whose bottom edge sits below 15% of image height, which fixes this. |
 | ChatGPT REFUSED on image | Retry with safer concept (no people, no medical photos). Pivots listed in WP skill. |
 | ChatGPT picks wrong image on download | Pass `--skip-ids <prev_file_ids>` to `fetch_chatgpt_image.py`, or `--pick N` to select specific image. |
 | Gateway timeout | Bump `OPENCLAW_TIMEOUT=120000`. If repeated, restart gateway only (not `browser stop` — that logs out FB + ChatGPT). |
