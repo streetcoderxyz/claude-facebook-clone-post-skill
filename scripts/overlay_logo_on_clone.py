@@ -33,10 +33,12 @@ Options:
     --fallback-corner POS
                         When no dashed placeholder is detected, place the logo
                         at this corner (top-left/top-right/bottom-left/bottom-
-                        right) instead of failing. Sizing scales to ~12% of the
-                        image width by default. Set to 'none' to fail (default).
-    --fallback-width N  Logo width in fallback mode (default: 12% of image width)
+                        right) instead of failing. Set to 'none' to fail.
+                        (default 'top-left')
     --fallback-margin N Margin from edge in fallback mode (default 32)
+    --max-width-pct F   Maximum logo width as a fraction of image width
+                        (default 0.15). Caps the logo so a huge placeholder
+                        doesn't produce a billboard-sized brand mark.
 
 Output (stdout, last line):
     OK <out_path> placeholder=(x,y,w,h) logo=(w,h)
@@ -64,9 +66,12 @@ WP_SKILL_LOGO = Path(
 def detect_placeholder(img: Image.Image) -> tuple[int, int, int, int] | None:
     """Find the dashed rectangle in the top header band.
 
-    Dashed stroke is light periwinkle blue (~ R 170-205, G 195-225, B 235-252)
-    on a slightly lighter header background. Dilate to bridge the dash gaps,
-    then take the largest left-side rectangular component.
+    Dash color varies per generation — sometimes light periwinkle
+    (~R180,G210,B245), sometimes saturated medium blue (~R92,G155,B253).
+    The reliable signature is: distinctly blue (b - r large), high blue
+    channel (b >= 230), and NOT the navy title text (which has b < 180).
+    Dilate to bridge the dash gaps, then take the largest left-side
+    component sitting in the top header band.
     """
     arr = np.array(img.convert("RGB"))
     H, W = arr.shape[:2]
@@ -76,14 +81,19 @@ def detect_placeholder(img: Image.Image) -> tuple[int, int, int, int] | None:
     r = strip[:, :, 0].astype(int)
     g = strip[:, :, 1].astype(int)
     b = strip[:, :, 2].astype(int)
+    # Blue-dominant, high-blue channel, not navy text (b >= 230 excludes navy),
+    # not background (r < 215 excludes ~bg=214).
     mask = (
-        (r >= 170) & (r <= 205)
-        & (g >= 195) & (g <= 225)
-        & (b >= 235) & (b <= 252)
+        (b >= 230)
+        & (b - r >= 40)
+        & (b - g >= 20)
+        & (r < 215)
     )
-    # Bridge dash gaps
+    # Bridge dash gaps. 9×9 with a single iteration is a sweet spot:
+    # wide enough to connect the placeholder's own dashes, narrow enough
+    # not to bridge across to decorative icons elsewhere in the header.
     dilated = ndimage.binary_dilation(
-        mask, structure=np.ones((11, 11), int), iterations=2
+        mask, structure=np.ones((9, 9), int), iterations=1
     )
     labels, n = ndimage.label(dilated)
     best = None
@@ -96,6 +106,11 @@ def detect_placeholder(img: Image.Image) -> tuple[int, int, int, int] | None:
         y0, y1 = int(ys.min()), int(ys.max())
         w, h = x1 - x0, y1 - y0
         if w < 100 or h < 40:
+            continue
+        # Reject components that span more than 45% of image width —
+        # those are header bands merged with decorative icons, not the
+        # isolated top-left placeholder.
+        if w > W * 0.45:
             continue
         # Must be on the left half (placeholder convention)
         if x0 > W * 0.5:
@@ -141,8 +156,8 @@ def render_logo(svg_or_png: Path, target_w: int = 1500) -> Image.Image:
 
 def overlay(post_dir: Path, src_override: Path | None, logo_path: Path,
             out_path: Path, pad: int, quality: int, debug: bool,
-            fallback_corner: str, fallback_width: int | None,
-            fallback_margin: int) -> int:
+            fallback_corner: str, fallback_margin: int,
+            max_width_pct: float) -> int:
     if src_override is not None:
         src = src_override
     else:
@@ -162,13 +177,15 @@ def overlay(post_dir: Path, src_override: Path | None, logo_path: Path,
         print(f"[debug] logo_tight={logo.size} aspect={logo.width/logo.height:.2f}",
               file=sys.stderr)
 
+    W, H = img.size
+    max_brand_w = max(1, int(W * max_width_pct))
+
     ph = detect_placeholder(img)
     if ph is None:
         if fallback_corner == "none":
             print("PLACEHOLDER_NOT_FOUND", file=sys.stderr)
             return 2
-        W, H = img.size
-        target_w = fallback_width if fallback_width else int(W * 0.12)
+        target_w = max_brand_w
         scale = target_w / logo.width
         new_w = max(1, int(logo.width * scale))
         new_h = max(1, int(logo.height * scale))
@@ -196,8 +213,10 @@ def overlay(post_dir: Path, src_override: Path | None, logo_path: Path,
         print(f"[debug] placeholder=(x{px}, y{py}, w{pw}, h{ph_h}) "
               f"aspect={pw/ph_h:.2f}", file=sys.stderr)
 
-    # Scale logo to fit inside placeholder (with inner padding), preserve aspect
-    max_w = max(1, pw - 2 * pad)
+    # Scale logo to fit inside placeholder (with inner padding), preserve
+    # aspect, AND cap at max_brand_w so a giant placeholder doesn't make
+    # the brand mark look like a billboard.
+    max_w = min(max(1, pw - 2 * pad), max_brand_w)
     max_h = max(1, ph_h - 2 * pad)
     scale = min(max_w / logo.width, max_h / logo.height)
     new_w = max(1, int(logo.width * scale))
@@ -225,10 +244,11 @@ def main() -> int:
     p.add_argument("--pad", type=int, default=10)
     p.add_argument("--quality", type=int, default=92)
     p.add_argument("--debug", action="store_true")
-    p.add_argument("--fallback-corner", default="none",
+    p.add_argument("--fallback-corner", default="top-left",
                    choices=["none", "top-left", "top-right", "bottom-left", "bottom-right"])
-    p.add_argument("--fallback-width", type=int, default=None)
     p.add_argument("--fallback-margin", type=int, default=32)
+    p.add_argument("--max-width-pct", type=float, default=0.15,
+                   help="Cap logo width at this fraction of image width (default 0.15)")
     args = p.parse_args()
 
     post_dir = args.post_dir.resolve()
@@ -246,8 +266,8 @@ def main() -> int:
         quality=args.quality,
         debug=args.debug,
         fallback_corner=args.fallback_corner,
-        fallback_width=args.fallback_width,
         fallback_margin=args.fallback_margin,
+        max_width_pct=args.max_width_pct,
     )
 
 
