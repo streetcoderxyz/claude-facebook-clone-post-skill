@@ -157,7 +157,7 @@ def render_logo(svg_or_png: Path, target_w: int = 1500) -> Image.Image:
 def overlay(post_dir: Path, src_override: Path | None, logo_path: Path,
             out_path: Path, pad: int, quality: int, debug: bool,
             fallback_corner: str, fallback_margin: int,
-            max_width_pct: float) -> int:
+            max_width_pct: float, force_corner: bool = False) -> int:
     if src_override is not None:
         src = src_override
     else:
@@ -180,7 +180,11 @@ def overlay(post_dir: Path, src_override: Path | None, logo_path: Path,
     W, H = img.size
     max_brand_w = max(1, int(W * max_width_pct))
 
-    ph = detect_placeholder(img)
+    # --force-corner skips detection entirely. Needed for art that was never
+    # prompted with a dashed placeholder (e.g. brand-framed clones): the
+    # detector otherwise "finds" a card edge mid-canvas and stamps the logo on
+    # top of the content.
+    ph = None if force_corner else detect_placeholder(img)
     if ph is None:
         if fallback_corner == "none":
             print("PLACEHOLDER_NOT_FOUND", file=sys.stderr)
@@ -249,7 +253,16 @@ def main() -> int:
     p.add_argument("--fallback-margin", type=int, default=32)
     p.add_argument("--max-width-pct", type=float, default=0.15,
                    help="Cap logo width at this fraction of image width (default 0.15)")
+    p.add_argument("--force-corner", action="store_true",
+                   help="Skip placeholder detection and always stamp at "
+                        "--fallback-corner. Use when the art has no dashed "
+                        "placeholder, so a false positive can't land the logo "
+                        "mid-canvas.")
     args = p.parse_args()
+
+    if args.force_corner and args.fallback_corner == "none":
+        print("--force-corner requires a real --fallback-corner", file=sys.stderr)
+        return 2
 
     post_dir = args.post_dir.resolve()
     if not post_dir.is_dir():
@@ -268,6 +281,7 @@ def main() -> int:
         fallback_corner=args.fallback_corner,
         fallback_margin=args.fallback_margin,
         max_width_pct=args.max_width_pct,
+        force_corner=args.force_corner,
     )
 
 
